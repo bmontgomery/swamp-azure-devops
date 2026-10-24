@@ -1,0 +1,773 @@
+/**
+ * Azure DevOps (Azure Repos) pull requests for swamp. Create or find a pull
+ * request for a branch, read its status, reviewer votes, and comment threads,
+ * publish a draft, and reply to or resolve review threads, so a workflow can
+ * run a full review loop.
+ *
+ * Authenticate with a personal access token (Code: Read & Write), usually
+ * supplied from a vault: `pat: ${{ vault.get(default, ADO_PAT) }}`.
+ *
+ * @module
+ */
+import { z } from "npm:zod@4";
+
+/** Global arguments shared by every method. */
+export const GlobalArgsSchema = z.object({
+  organization: z.string().min(1).describe(
+    "Organization name (the `myorg` in dev.azure.com/myorg).",
+  ),
+  project: z.string().min(1).describe("Project name or id."),
+  repository: z.string().min(1).describe("Repository name or id."),
+  pat: z.string().min(1).meta({ sensitive: true }).describe(
+    "Personal access token with Code (Read & Write) scope.",
+  ),
+  baseUrl: z.string().url().default("https://dev.azure.com").describe(
+    "Service URL; change only for Azure DevOps Server.",
+  ),
+});
+
+/** Resolved global argument type. */
+export type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
+
+/** Reviewer vote values and their meaning. */
+export const VOTE_LABELS: Readonly<Record<number, string>> = {
+  10: "approved",
+  5: "approvedWithSuggestions",
+  0: "noVote",
+  [-5]: "waitingForAuthor",
+  [-10]: "rejected",
+};
+
+/** A reviewer and their current vote. */
+export const ReviewerSchema = z.object({
+  id: z.string(),
+  displayName: z.string(),
+  uniqueName: z.string().nullable(),
+  vote: z.number().int(),
+  voteLabel: z.string(),
+  isRequired: z.boolean(),
+});
+
+/** One comment in a thread. `commentType` is `text` for people, `system` for ADO. */
+export const CommentSchema = z.object({
+  id: z.number().int(),
+  parentCommentId: z.number().int(),
+  authorName: z.string().nullable(),
+  authorUniqueName: z.string().nullable(),
+  content: z.string(),
+  publishedDate: z.string(),
+  commentType: z.string(),
+});
+
+/** A comment thread, optionally anchored to a file and line. */
+export const ThreadSchema = z.object({
+  id: z.number().int(),
+  status: z.string(),
+  filePath: z.string().nullable(),
+  line: z.number().int().nullable(),
+  publishedDate: z.string(),
+  lastUpdatedDate: z.string(),
+  comments: z.array(CommentSchema),
+});
+
+/** Thread type. */
+export type Thread = z.infer<typeof ThreadSchema>;
+
+/** A pull request snapshot (`pr-<id>`). */
+export const PullRequestSchema = z.object({
+  id: z.number().int(),
+  url: z.string().describe("Web URL of the pull request."),
+  title: z.string(),
+  description: z.string(),
+  status: z.enum(["active", "completed", "abandoned", "notSet", "all"]),
+  isDraft: z.boolean(),
+  sourceBranch: z.string(),
+  targetBranch: z.string(),
+  createdBy: z.string().nullable(),
+  creationDate: z.string(),
+  closedDate: z.string().nullable(),
+  mergeStatus: z.string().nullable(),
+  lastMergeSourceCommit: z.string().nullable(),
+  lastMergeCommit: z.string().nullable(),
+  reviewers: z.array(ReviewerSchema),
+  threads: z.array(ThreadSchema),
+  fetchedAt: z.string(),
+});
+
+/** Pull request snapshot type. */
+export type PullRequest = z.infer<typeof PullRequestSchema>;
+
+/** Stable pointer from a source branch to its pull request (`branch-<slug>`). */
+export const BranchRefSchema = z.object({
+  sourceBranch: z.string(),
+  targetBranch: z.string(),
+  pullRequestId: z.number().int(),
+  url: z.string(),
+  created: z.boolean().describe(
+    "False when an existing pull request was reused.",
+  ),
+  resolvedAt: z.string(),
+});
+
+/** A comment the bot posted or found (`comment-<threadId>-<commentId>`). */
+export const PostedCommentSchema = z.object({
+  pullRequestId: z.number().int(),
+  threadId: z.number().int(),
+  commentId: z.number().int(),
+  content: z.string(),
+  threadStatus: z.string(),
+  existing: z.boolean().describe(
+    "True when `skipIfContains` matched and nothing was posted.",
+  ),
+  postedAt: z.string(),
+});
+
+/** Thread statuses Azure DevOps accepts. */
+export const ThreadStatusEnum = z.enum([
+  "active",
+  "fixed",
+  "wontFix",
+  "closed",
+  "byDesign",
+  "pending",
+]);
+
+/** Minimal fetch signature, so tests can inject a stub. */
+export type FetchFn = (
+  input: string,
+  init?: RequestInit,
+) => Promise<Response>;
+
+const API_VERSION = "7.1";
+
+/** Thin Azure DevOps Git REST client: PAT auth, JSON, 429/503 backoff. */
+export class AdoClient {
+  private readonly repoRoot: string;
+  private readonly webRoot: string;
+
+  /** Create a client for one repository. */
+  constructor(
+    private readonly args: GlobalArgs,
+    private readonly fetchFn: FetchFn = fetch,
+    private readonly maxRetries = 3,
+  ) {
+    const base = args.baseUrl.replace(/\/+$/, "");
+    const org = encodeURIComponent(args.organization);
+    const project = encodeURIComponent(args.project);
+    const repo = encodeURIComponent(args.repository);
+    this.repoRoot = `${base}/${org}/${project}/_apis/git/repositories/${repo}`;
+    this.webRoot = `${base}/${org}/${project}/_git/${repo}`;
+  }
+
+  /** Web URL a person opens to see a pull request. */
+  webUrl(pullRequestId: number): string {
+    return `${this.webRoot}/pullrequest/${pullRequestId}`;
+  }
+
+  /** Call a path under the repository with optional query and JSON body. */
+  async request<T>(
+    method: "GET" | "POST" | "PATCH",
+    path: string,
+    query: Record<string, string> = {},
+    body?: unknown,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const url = new URL(`${this.repoRoot}${path}`);
+    for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
+    url.searchParams.set("api-version", API_VERSION);
+    for (let attempt = 0;; attempt++) {
+      const res = await this.fetchFn(url.toString(), {
+        method,
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          Authorization: `Basic ${btoa(`:${this.args.pat}`)}`,
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal,
+      });
+      if (
+        (res.status === 429 || res.status === 503) && attempt < this.maxRetries
+      ) {
+        await res.body?.cancel();
+        const retryAfter = Number(res.headers.get("Retry-After"));
+        const delayMs = retryAfter > 0
+          ? retryAfter * 1000
+          : 1000 * 2 ** attempt;
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      // A wrong or expired PAT gets a 203 sign-in page instead of a 401.
+      const type = res.headers.get("Content-Type") ?? "";
+      if (!res.ok || !type.includes("json")) {
+        const text = (await res.text()).slice(0, 300);
+        throw new Error(
+          `Azure DevOps ${method} ${path} failed: ${res.status}${
+            type.includes("json") ? "" : " (not JSON; check the token)"
+          } ${text}`,
+        );
+      }
+      return await res.json() as T;
+    }
+  }
+}
+
+/** `feature/x` or `refs/heads/feature/x` → `refs/heads/feature/x`. */
+export function toRef(branch: string): string {
+  return branch.startsWith("refs/") ? branch : `refs/heads/${branch}`;
+}
+
+/** `refs/heads/feature/x` → `feature/x`. */
+export function fromRef(ref: string): string {
+  return ref.replace(/^refs\/heads\//, "");
+}
+
+/** Branch name made safe for a data instance name (`feature/x` → `feature-x`). */
+export function branchSlug(branch: string): string {
+  return fromRef(branch).replace(/[^A-Za-z0-9._-]+/g, "-").replace(
+    /^-+|-+$/g,
+    "",
+  );
+}
+
+interface RawIdentity {
+  id?: string;
+  displayName?: string;
+  uniqueName?: string;
+}
+
+interface RawPullRequest {
+  pullRequestId: number;
+  title: string;
+  description?: string;
+  status: string;
+  isDraft?: boolean;
+  sourceRefName: string;
+  targetRefName: string;
+  createdBy?: RawIdentity;
+  creationDate: string;
+  closedDate?: string;
+  mergeStatus?: string;
+  lastMergeSourceCommit?: { commitId: string };
+  lastMergeCommit?: { commitId: string };
+  reviewers?: Array<RawIdentity & { vote: number; isRequired?: boolean }>;
+}
+
+interface RawComment {
+  id: number;
+  parentCommentId?: number;
+  author?: RawIdentity;
+  content?: string;
+  publishedDate: string;
+  commentType?: string;
+  isDeleted?: boolean;
+}
+
+interface RawThread {
+  id: number;
+  status?: string;
+  isDeleted?: boolean;
+  publishedDate: string;
+  lastUpdatedDate: string;
+  threadContext?: {
+    filePath?: string;
+    rightFileStart?: { line: number };
+    leftFileStart?: { line: number };
+  } | null;
+  comments?: RawComment[];
+}
+
+/** Map a raw thread to the stored shape, dropping deleted comments. */
+export function toThread(t: RawThread): Thread {
+  return {
+    id: t.id,
+    status: t.status ?? "unknown",
+    filePath: t.threadContext?.filePath ?? null,
+    line: t.threadContext?.rightFileStart?.line ??
+      t.threadContext?.leftFileStart?.line ?? null,
+    publishedDate: t.publishedDate,
+    lastUpdatedDate: t.lastUpdatedDate,
+    comments: (t.comments ?? [])
+      .filter((c) => !c.isDeleted)
+      .map((c) => ({
+        id: c.id,
+        parentCommentId: c.parentCommentId ?? 0,
+        authorName: c.author?.displayName ?? null,
+        authorUniqueName: c.author?.uniqueName ?? null,
+        content: c.content ?? "",
+        publishedDate: c.publishedDate,
+        commentType: c.commentType ?? "text",
+      })),
+  };
+}
+
+/** Map a raw pull request (plus threads) to the stored snapshot. */
+export function toPullRequest(
+  pr: RawPullRequest,
+  threads: RawThread[],
+  url: string,
+  fetchedAt: string,
+): PullRequest {
+  return {
+    id: pr.pullRequestId,
+    url,
+    title: pr.title,
+    description: pr.description ?? "",
+    status: pr.status as PullRequest["status"],
+    isDraft: pr.isDraft ?? false,
+    sourceBranch: fromRef(pr.sourceRefName),
+    targetBranch: fromRef(pr.targetRefName),
+    createdBy: pr.createdBy?.displayName ?? null,
+    creationDate: pr.creationDate,
+    closedDate: pr.closedDate ?? null,
+    mergeStatus: pr.mergeStatus ?? null,
+    lastMergeSourceCommit: pr.lastMergeSourceCommit?.commitId ?? null,
+    lastMergeCommit: pr.lastMergeCommit?.commitId ?? null,
+    reviewers: (pr.reviewers ?? []).map((r) => ({
+      id: r.id ?? "",
+      displayName: r.displayName ?? "",
+      uniqueName: r.uniqueName ?? null,
+      vote: r.vote,
+      voteLabel: VOTE_LABELS[r.vote] ?? String(r.vote),
+      isRequired: r.isRequired ?? false,
+    })),
+    threads: threads.filter((t) => !t.isDeleted).map(toThread),
+    fetchedAt,
+  };
+}
+
+/** Load a pull request and, optionally, its threads. */
+export async function fetchPullRequest(
+  client: AdoClient,
+  pullRequestId: number,
+  includeThreads: boolean,
+  signal?: AbortSignal,
+): Promise<PullRequest> {
+  const [pr, threads] = await Promise.all([
+    client.request<RawPullRequest>(
+      "GET",
+      `/pullrequests/${pullRequestId}`,
+      {},
+      undefined,
+      signal,
+    ),
+    includeThreads
+      ? client.request<{ value: RawThread[] }>(
+        "GET",
+        `/pullrequests/${pullRequestId}/threads`,
+        {},
+        undefined,
+        signal,
+      ).then((r) => r.value)
+      : Promise.resolve([]),
+  ]);
+  return toPullRequest(
+    pr,
+    threads,
+    client.webUrl(pullRequestId),
+    new Date().toISOString(),
+  );
+}
+
+type WriteResource = (
+  specName: string,
+  name: string,
+  data: Record<string, unknown>,
+) => Promise<{ name: string }>;
+
+interface MethodContext {
+  globalArgs: GlobalArgs;
+  writeResource: WriteResource;
+  signal?: AbortSignal;
+  logger: { info: (msg: string, props?: Record<string, unknown>) => void };
+}
+
+type MethodResult = Promise<{ dataHandles: Array<{ name: string }> }>;
+
+function clientFor(ctx: MethodContext): AdoClient {
+  return new AdoClient(GlobalArgsSchema.parse(ctx.globalArgs));
+}
+
+async function writeSnapshot(
+  ctx: MethodContext,
+  pr: PullRequest,
+): Promise<{ name: string }> {
+  return await ctx.writeResource("pullRequest", `pr-${pr.id}`, pr);
+}
+
+/** Find a comment containing `marker` in any thread. */
+export function findComment(
+  threads: Thread[],
+  marker: string,
+): { thread: Thread; commentId: number } | null {
+  for (const thread of threads) {
+    const hit = thread.comments.find((c) => c.content.includes(marker));
+    if (hit) return { thread, commentId: hit.id };
+  }
+  return null;
+}
+
+/** Model definition for `@bmonty/azure-devops/pull-request`. */
+export const model = {
+  type: "@bmonty/azure-devops/pull-request",
+  version: "2026.10.24.1",
+  globalArguments: GlobalArgsSchema,
+  resources: {
+    pullRequest: {
+      description:
+        "Pull request snapshot with reviewers and threads (`pr-<id>`)",
+      schema: PullRequestSchema,
+      lifetime: "infinite",
+      garbageCollection: 20,
+    },
+    branchRef: {
+      description: "Pull request for a source branch (`branch-<slug>`)",
+      schema: BranchRefSchema,
+      lifetime: "infinite",
+      garbageCollection: 5,
+    },
+    comment: {
+      description:
+        "A comment posted or found (`comment-<threadId>-<commentId>`)",
+      schema: PostedCommentSchema,
+      lifetime: "infinite",
+      garbageCollection: 1,
+    },
+  },
+  methods: {
+    ensurePullRequest: {
+      description:
+        "Return the open pull request from a branch to a target, creating it (draft by default) if none exists",
+      arguments: z.object({
+        sourceBranch: z.string().min(1).describe("Branch with the changes."),
+        targetBranch: z.string().min(1).describe("Branch to merge into."),
+        title: z.string().min(1).max(400),
+        description: z.string().max(4000).default(""),
+        draft: z.boolean().default(true),
+      }),
+      execute: async (
+        args: {
+          sourceBranch: string;
+          targetBranch: string;
+          title: string;
+          description: string;
+          draft: boolean;
+        },
+        ctx: MethodContext,
+      ): MethodResult => {
+        const client = clientFor(ctx);
+        const existing = await client.request<{ value: RawPullRequest[] }>(
+          "GET",
+          "/pullrequests",
+          {
+            "searchCriteria.sourceRefName": toRef(args.sourceBranch),
+            "searchCriteria.targetRefName": toRef(args.targetBranch),
+            "searchCriteria.status": "active",
+          },
+          undefined,
+          ctx.signal,
+        );
+        let id = existing.value[0]?.pullRequestId;
+        const created = id === undefined;
+        if (created) {
+          const pr = await client.request<RawPullRequest>(
+            "POST",
+            "/pullrequests",
+            {},
+            {
+              sourceRefName: toRef(args.sourceBranch),
+              targetRefName: toRef(args.targetBranch),
+              title: args.title,
+              description: args.description,
+              isDraft: args.draft,
+            },
+            ctx.signal,
+          );
+          id = pr.pullRequestId;
+        }
+        const pr = await fetchPullRequest(client, id!, true, ctx.signal);
+        ctx.logger.info("Pull request {id} {action}: {url}", {
+          id: pr.id,
+          action: created ? "created" : "reused",
+          url: pr.url,
+        });
+        return {
+          dataHandles: [
+            await writeSnapshot(ctx, pr),
+            await ctx.writeResource(
+              "branchRef",
+              `branch-${branchSlug(args.sourceBranch)}`,
+              {
+                sourceBranch: fromRef(args.sourceBranch),
+                targetBranch: fromRef(args.targetBranch),
+                pullRequestId: pr.id,
+                url: pr.url,
+                created,
+                resolvedAt: new Date().toISOString(),
+              },
+            ),
+          ],
+        };
+      },
+    },
+    get: {
+      description:
+        "Read a pull request's status, draft flag, reviewer votes, and comment threads",
+      arguments: z.object({
+        pullRequestId: z.number().int().positive(),
+        includeThreads: z.boolean().default(true),
+      }),
+      execute: async (
+        args: { pullRequestId: number; includeThreads: boolean },
+        ctx: MethodContext,
+      ): MethodResult => {
+        const pr = await fetchPullRequest(
+          clientFor(ctx),
+          args.pullRequestId,
+          args.includeThreads,
+          ctx.signal,
+        );
+        return { dataHandles: [await writeSnapshot(ctx, pr)] };
+      },
+    },
+    update: {
+      description:
+        "Publish a draft (draft: false), return it to draft, or change the title or description",
+      arguments: z.object({
+        pullRequestId: z.number().int().positive(),
+        draft: z.boolean().optional(),
+        title: z.string().min(1).max(400).optional(),
+        description: z.string().max(4000).optional(),
+      }),
+      execute: async (
+        args: {
+          pullRequestId: number;
+          draft?: boolean;
+          title?: string;
+          description?: string;
+        },
+        ctx: MethodContext,
+      ): MethodResult => {
+        const client = clientFor(ctx);
+        const patch: Record<string, unknown> = {};
+        if (args.draft !== undefined) patch.isDraft = args.draft;
+        if (args.title !== undefined) patch.title = args.title;
+        if (args.description !== undefined) {
+          patch.description = args.description;
+        }
+        if (Object.keys(patch).length === 0) {
+          throw new Error(
+            "Nothing to update: give draft, title, or description",
+          );
+        }
+        await client.request(
+          "PATCH",
+          `/pullrequests/${args.pullRequestId}`,
+          {},
+          patch,
+          ctx.signal,
+        );
+        const pr = await fetchPullRequest(
+          client,
+          args.pullRequestId,
+          false,
+          ctx.signal,
+        );
+        return { dataHandles: [await writeSnapshot(ctx, pr)] };
+      },
+    },
+    addComment: {
+      description:
+        "Start a new comment thread on the pull request (markdown), optionally skipped if a marker is already present",
+      arguments: z.object({
+        pullRequestId: z.number().int().positive(),
+        content: z.string().min(1).max(150000),
+        status: ThreadStatusEnum.default("active").describe(
+          "Thread status; use `closed` for informational comments.",
+        ),
+        skipIfContains: z.string().min(1).optional().describe(
+          "Don't post if any existing comment contains this text; makes the call safe to retry.",
+        ),
+      }),
+      execute: async (
+        args: {
+          pullRequestId: number;
+          content: string;
+          status: z.infer<typeof ThreadStatusEnum>;
+          skipIfContains?: string;
+        },
+        ctx: MethodContext,
+      ): MethodResult => {
+        const client = clientFor(ctx);
+        let found: ReturnType<typeof findComment> = null;
+        if (args.skipIfContains) {
+          const pr = await fetchPullRequest(
+            client,
+            args.pullRequestId,
+            true,
+            ctx.signal,
+          );
+          found = findComment(pr.threads, args.skipIfContains);
+        }
+        let threadId: number;
+        let commentId: number;
+        let status: string;
+        if (found) {
+          threadId = found.thread.id;
+          commentId = found.commentId;
+          status = found.thread.status;
+        } else {
+          const thread = await client.request<RawThread>(
+            "POST",
+            `/pullrequests/${args.pullRequestId}/threads`,
+            {},
+            {
+              comments: [{
+                parentCommentId: 0,
+                content: args.content,
+                commentType: 1,
+              }],
+              status: args.status,
+            },
+            ctx.signal,
+          );
+          threadId = thread.id;
+          commentId = thread.comments?.[0]?.id ?? 1;
+          status = thread.status ?? args.status;
+        }
+        return {
+          dataHandles: [
+            await ctx.writeResource(
+              "comment",
+              `comment-${threadId}-${commentId}`,
+              {
+                pullRequestId: args.pullRequestId,
+                threadId,
+                commentId,
+                content: args.content,
+                threadStatus: status,
+                existing: found !== null,
+                postedAt: new Date().toISOString(),
+              },
+            ),
+          ],
+        };
+      },
+    },
+    reply: {
+      description:
+        "Reply to a comment thread and optionally set its status (e.g. fixed)",
+      arguments: z.object({
+        pullRequestId: z.number().int().positive(),
+        threadId: z.number().int().positive(),
+        content: z.string().min(1).max(150000),
+        status: ThreadStatusEnum.optional().describe(
+          "Set the thread status after replying (e.g. `fixed` once addressed).",
+        ),
+        skipIfContains: z.string().min(1).optional().describe(
+          "Don't post if a comment in this thread already contains this text.",
+        ),
+      }),
+      execute: async (
+        args: {
+          pullRequestId: number;
+          threadId: number;
+          content: string;
+          status?: z.infer<typeof ThreadStatusEnum>;
+          skipIfContains?: string;
+        },
+        ctx: MethodContext,
+      ): MethodResult => {
+        const client = clientFor(ctx);
+        const base =
+          `/pullrequests/${args.pullRequestId}/threads/${args.threadId}`;
+        let commentId: number | undefined;
+        if (args.skipIfContains) {
+          const marker = args.skipIfContains;
+          const thread = toThread(
+            await client.request<RawThread>(
+              "GET",
+              base,
+              {},
+              undefined,
+              ctx.signal,
+            ),
+          );
+          commentId = thread.comments.find((c) => c.content.includes(marker))
+            ?.id;
+        }
+        const existing = commentId !== undefined;
+        if (!existing) {
+          const posted = await client.request<RawComment>(
+            "POST",
+            `${base}/comments`,
+            {},
+            { content: args.content, parentCommentId: 1, commentType: 1 },
+            ctx.signal,
+          );
+          commentId = posted.id;
+        }
+        let status = "unchanged";
+        if (args.status) {
+          const updated = await client.request<RawThread>(
+            "PATCH",
+            base,
+            {},
+            { status: args.status },
+            ctx.signal,
+          );
+          status = updated.status ?? args.status;
+        }
+        return {
+          dataHandles: [
+            await ctx.writeResource(
+              "comment",
+              `comment-${args.threadId}-${commentId}`,
+              {
+                pullRequestId: args.pullRequestId,
+                threadId: args.threadId,
+                commentId: commentId!,
+                content: args.content,
+                threadStatus: status,
+                existing,
+                postedAt: new Date().toISOString(),
+              },
+            ),
+          ],
+        };
+      },
+    },
+    setThreadStatus: {
+      description: "Set a comment thread's status (active, fixed, closed, ...)",
+      arguments: z.object({
+        pullRequestId: z.number().int().positive(),
+        threadId: z.number().int().positive(),
+        status: ThreadStatusEnum,
+      }),
+      execute: async (
+        args: {
+          pullRequestId: number;
+          threadId: number;
+          status: z.infer<typeof ThreadStatusEnum>;
+        },
+        ctx: MethodContext,
+      ): MethodResult => {
+        const client = clientFor(ctx);
+        await client.request(
+          "PATCH",
+          `/pullrequests/${args.pullRequestId}/threads/${args.threadId}`,
+          {},
+          { status: args.status },
+          ctx.signal,
+        );
+        const pr = await fetchPullRequest(
+          client,
+          args.pullRequestId,
+          true,
+          ctx.signal,
+        );
+        return { dataHandles: [await writeSnapshot(ctx, pr)] };
+      },
+    },
+  },
+};
