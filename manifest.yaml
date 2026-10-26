@@ -1,12 +1,13 @@
 manifestVersion: 1
 name: "@bmonty/azure-devops"
-version: "2026.10.26.1"
+version: "2026.10.26.2"
 license: MIT
-description: "Drive Azure DevOps pull request reviews from swamp workflows: create or find draft PRs, read reviewer votes and comment threads, publish drafts, and reply to or resolve threads."
+description: "Drive Azure DevOps from swamp workflows: run pull request reviews (draft PRs, reviewer votes, comment threads) and run YAML pipelines (queue with parameters, follow stages, stop at approvals)."
 repository: https://github.com/bmontgomery/swamp-azure-devops
 
 models:
   - azure_devops/pull_request.ts
+  - azure_devops/pipeline.ts
 additionalFiles:
   - README.md
   - LICENSE
@@ -14,3 +15,5 @@ labels:
   - azure-devops
   - pull-requests
   - code-review
+  - pipelines
+  - deployment
