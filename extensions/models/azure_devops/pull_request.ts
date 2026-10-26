@@ -21,9 +21,11 @@ export const GlobalArgsSchema = z.object({
   pat: z.string().min(1).meta({ sensitive: true }).describe(
     "Personal access token with Code (Read & Write) scope.",
   ),
-  baseUrl: z.string().url().default("https://dev.azure.com").describe(
-    "Service URL; change only for Azure DevOps Server.",
-  ),
+  baseUrl: z.string().url().default("https://dev.azure.com")
+    .refine((u) => u.startsWith("https://"), {
+      message: "baseUrl must use https; the token would be sent in clear text",
+    })
+    .describe("Service URL; change only for Azure DevOps Server."),
 });
 
 /** Resolved global argument type. */
@@ -143,7 +145,73 @@ export type FetchFn = (
 
 const API_VERSION = "7.1";
 
-/** Thin Azure DevOps Git REST client: PAT auth, JSON, 429/503 backoff. */
+/** The longest the client waits between retries, whatever `Retry-After` says. */
+export const MAX_RETRY_DELAY_MS = 60_000;
+
+/** Statuses worth retrying for reads and updates; creates (POST) retry only on 429. */
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/** A failed Azure DevOps call. `status` is null for network errors. */
+export class AdoError extends Error {
+  /** Create an error for a failed call. */
+  constructor(message: string, readonly status: number | null) {
+    super(message);
+    this.name = "AdoError";
+  }
+}
+
+/** Called before each retry, so the caller can log it. */
+export type RetryListener = (
+  info: { method: string; path: string; reason: string; delayMs: number },
+) => void;
+
+/** Delay before retry `attempt` (0-based): `Retry-After` if given, else exponential; capped. */
+export function retryDelayMs(
+  attempt: number,
+  retryAfter: string | null,
+): number {
+  const seconds = Number(retryAfter);
+  const ms = seconds > 0 ? seconds * 1000 : 1000 * 2 ** attempt;
+  return Math.min(ms, MAX_RETRY_DELAY_MS);
+}
+
+/** Wait `ms`, or reject as soon as `signal` aborts. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** Required fields of the responses the extension reads. */
+const RawPullRequestShape = z.object({
+  pullRequestId: z.number(),
+  title: z.string(),
+  status: z.string(),
+  sourceRefName: z.string(),
+  targetRefName: z.string(),
+  creationDate: z.string(),
+});
+const RawPullRequestListShape = z.object({
+  value: z.array(z.object({ pullRequestId: z.number() })),
+});
+const RawCommentShape = z.object({ id: z.number() });
+const RawThreadShape = z.object({
+  id: z.number(),
+  publishedDate: z.string(),
+  comments: z.array(RawCommentShape).optional(),
+});
+const RawThreadListShape = z.object({ value: z.array(RawThreadShape) });
+
+/** Thin Azure DevOps Git REST client: PAT auth, JSON, retries with backoff. */
 export class AdoClient {
   private readonly repoRoot: string;
   private readonly webRoot: string;
@@ -153,6 +221,7 @@ export class AdoClient {
     private readonly args: GlobalArgs,
     private readonly fetchFn: FetchFn = fetch,
     private readonly maxRetries = 3,
+    private readonly onRetry: RetryListener = () => {},
   ) {
     const base = args.baseUrl.replace(/\/+$/, "");
     const org = encodeURIComponent(args.organization);
@@ -167,51 +236,112 @@ export class AdoClient {
     return `${this.webRoot}/pullrequest/${pullRequestId}`;
   }
 
-  /** Call a path under the repository with optional query and JSON body. */
+  /**
+   * Call a path under the repository with optional query and JSON body.
+   * Reads and updates are retried on 429, 5xx, and network errors. Creates
+   * (POST) are retried only on 429, which means the request was not applied,
+   * so a retry never posts twice. With `shape`, the response is checked for
+   * the fields the caller relies on.
+   */
   async request<T>(
     method: "GET" | "POST" | "PATCH",
     path: string,
     query: Record<string, string> = {},
     body?: unknown,
     signal?: AbortSignal,
+    shape?: z.ZodType,
   ): Promise<T> {
     const url = new URL(`${this.repoRoot}${path}`);
     for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
     url.searchParams.set("api-version", API_VERSION);
     for (let attempt = 0;; attempt++) {
-      const res = await this.fetchFn(url.toString(), {
-        method,
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          Authorization: `Basic ${btoa(`:${this.args.pat}`)}`,
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal,
-      });
-      if (
-        (res.status === 429 || res.status === 503) && attempt < this.maxRetries
-      ) {
+      let res: Response;
+      try {
+        res = await this.fetchFn(url.toString(), {
+          method,
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            Authorization: `Basic ${btoa(`:${this.args.pat}`)}`,
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal,
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (
+          signal?.aborted || method === "POST" || attempt >= this.maxRetries
+        ) {
+          throw new AdoError(
+            `Azure DevOps ${method} ${path} failed: network error: ${reason}`,
+            null,
+          );
+        }
+        await this.backoff(
+          attempt,
+          null,
+          `network error: ${reason}`,
+          method,
+          path,
+          signal,
+        );
+        continue;
+      }
+      const retryable = method === "POST"
+        ? res.status === 429
+        : RETRYABLE_STATUSES.has(res.status);
+      if (retryable && attempt < this.maxRetries) {
         await res.body?.cancel();
-        const retryAfter = Number(res.headers.get("Retry-After"));
-        const delayMs = retryAfter > 0
-          ? retryAfter * 1000
-          : 1000 * 2 ** attempt;
-        await new Promise((r) => setTimeout(r, delayMs));
+        await this.backoff(
+          attempt,
+          res.headers.get("Retry-After"),
+          `HTTP ${res.status}`,
+          method,
+          path,
+          signal,
+        );
         continue;
       }
       // A wrong or expired PAT gets a 203 sign-in page instead of a 401.
       const type = res.headers.get("Content-Type") ?? "";
       if (!res.ok || !type.includes("json")) {
         const text = (await res.text()).slice(0, 300);
-        throw new Error(
+        throw new AdoError(
           `Azure DevOps ${method} ${path} failed: ${res.status}${
             type.includes("json") ? "" : " (not JSON; check the token)"
           } ${text}`,
+          res.status,
         );
       }
-      return await res.json() as T;
+      const json = await res.json();
+      if (shape) {
+        const checked = shape.safeParse(json);
+        if (!checked.success) {
+          throw new AdoError(
+            `Azure DevOps ${method} ${path} returned an unexpected response: ${
+              checked.error.issues.slice(0, 3).map((i) =>
+                `${i.path.join(".") || "(root)"}: ${i.message}`
+              ).join("; ")
+            }`,
+            res.status,
+          );
+        }
+      }
+      return json as T;
     }
+  }
+
+  private async backoff(
+    attempt: number,
+    retryAfter: string | null,
+    reason: string,
+    method: string,
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const delayMs = retryDelayMs(attempt, retryAfter);
+    this.onRetry({ method, path, reason, delayMs });
+    await sleep(delayMs, signal);
   }
 }
 
@@ -354,6 +484,7 @@ export async function fetchPullRequest(
       {},
       undefined,
       signal,
+      RawPullRequestShape,
     ),
     includeThreads
       ? client.request<{ value: RawThread[] }>(
@@ -362,6 +493,7 @@ export async function fetchPullRequest(
         {},
         undefined,
         signal,
+        RawThreadListShape,
       ).then((r) => r.value)
       : Promise.resolve(null),
   ]);
@@ -383,13 +515,47 @@ interface MethodContext {
   globalArgs: GlobalArgs;
   writeResource: WriteResource;
   signal?: AbortSignal;
-  logger: { info: (msg: string, props?: Record<string, unknown>) => void };
+  logger: {
+    info: (msg: string, props?: Record<string, unknown>) => void;
+    warning: (msg: string, props?: Record<string, unknown>) => void;
+  };
 }
 
 type MethodResult = Promise<{ dataHandles: Array<{ name: string }> }>;
 
 function clientFor(ctx: MethodContext): AdoClient {
-  return new AdoClient(GlobalArgsSchema.parse(ctx.globalArgs));
+  return new AdoClient(
+    GlobalArgsSchema.parse(ctx.globalArgs),
+    fetch,
+    3,
+    (r) =>
+      ctx.logger.warning(
+        "Azure DevOps {method} {path} failed ({reason}); retrying in {delayMs} ms",
+        r,
+      ),
+  );
+}
+
+/** The open pull request from `source` to `target`, if there is one. */
+async function findActivePullRequest(
+  client: AdoClient,
+  source: string,
+  target: string,
+  signal?: AbortSignal,
+): Promise<number | undefined> {
+  const found = await client.request<{ value: RawPullRequest[] }>(
+    "GET",
+    "/pullrequests",
+    {
+      "searchCriteria.sourceRefName": toRef(source),
+      "searchCriteria.targetRefName": toRef(target),
+      "searchCriteria.status": "active",
+    },
+    undefined,
+    signal,
+    RawPullRequestListShape,
+  );
+  return found.value[0]?.pullRequestId;
 }
 
 async function writeSnapshot(
@@ -460,34 +626,48 @@ export const model = {
         ctx: MethodContext,
       ): MethodResult => {
         const client = clientFor(ctx);
-        const existing = await client.request<{ value: RawPullRequest[] }>(
-          "GET",
-          "/pullrequests",
-          {
-            "searchCriteria.sourceRefName": toRef(args.sourceBranch),
-            "searchCriteria.targetRefName": toRef(args.targetBranch),
-            "searchCriteria.status": "active",
-          },
-          undefined,
+        ctx.logger.info("Finding pull request {source} -> {target}", {
+          source: args.sourceBranch,
+          target: args.targetBranch,
+        });
+        let id = await findActivePullRequest(
+          client,
+          args.sourceBranch,
+          args.targetBranch,
           ctx.signal,
         );
-        let id = existing.value[0]?.pullRequestId;
-        const created = id === undefined;
+        let created = id === undefined;
         if (created) {
-          const pr = await client.request<RawPullRequest>(
-            "POST",
-            "/pullrequests",
-            {},
-            {
-              sourceRefName: toRef(args.sourceBranch),
-              targetRefName: toRef(args.targetBranch),
-              title: args.title,
-              description: args.description,
-              isDraft: args.draft,
-            },
-            ctx.signal,
-          );
-          id = pr.pullRequestId;
+          try {
+            const pr = await client.request<RawPullRequest>(
+              "POST",
+              "/pullrequests",
+              {},
+              {
+                sourceRefName: toRef(args.sourceBranch),
+                targetRefName: toRef(args.targetBranch),
+                title: args.title,
+                description: args.description,
+                isDraft: args.draft,
+              },
+              ctx.signal,
+              RawPullRequestShape,
+            );
+            id = pr.pullRequestId;
+          } catch (error) {
+            // Another run created it between the search and the create.
+            if (!(error instanceof AdoError) || error.status !== 409) {
+              throw error;
+            }
+            id = await findActivePullRequest(
+              client,
+              args.sourceBranch,
+              args.targetBranch,
+              ctx.signal,
+            );
+            if (id === undefined) throw error;
+            created = false;
+          }
         }
         const pr = await fetchPullRequest(client, id!, true, ctx.signal);
         ctx.logger.info("Pull request {id} {action}: {url}", {
@@ -525,11 +705,24 @@ export const model = {
         args: { pullRequestId: number; includeThreads: boolean },
         ctx: MethodContext,
       ): MethodResult => {
+        ctx.logger.info("Reading pull request {id}", {
+          id: args.pullRequestId,
+        });
         const pr = await fetchPullRequest(
           clientFor(ctx),
           args.pullRequestId,
           args.includeThreads,
           ctx.signal,
+        );
+        ctx.logger.info(
+          "Pull request {id} is {status}{draft}: {reviewers} reviewer(s), {threads} thread(s)",
+          {
+            id: pr.id,
+            status: pr.status,
+            draft: pr.isDraft ? " (draft)" : "",
+            reviewers: pr.reviewers.length,
+            threads: pr.threadsIncluded ? pr.threads.length : "unread",
+          },
         );
         return { dataHandles: [await writeSnapshot(ctx, pr)] };
       },
@@ -564,6 +757,10 @@ export const model = {
             "Nothing to update: give draft, title, or description",
           );
         }
+        ctx.logger.info("Updating pull request {id}: {fields}", {
+          id: args.pullRequestId,
+          fields: Object.keys(patch).join(", "),
+        });
         await client.request(
           "PATCH",
           `/pullrequests/${args.pullRequestId}`,
@@ -578,6 +775,10 @@ export const model = {
           true,
           ctx.signal,
         );
+        ctx.logger.info("Updated pull request {id}{draft}", {
+          id: pr.id,
+          draft: pr.isDraft ? " (draft)" : "",
+        });
         return { dataHandles: [await writeSnapshot(ctx, pr)] };
       },
     },
@@ -635,6 +836,7 @@ export const model = {
               status: args.status,
             },
             ctx.signal,
+            RawThreadShape,
           );
           const first = thread.comments?.[0]?.id;
           if (first === undefined) {
@@ -646,6 +848,15 @@ export const model = {
           commentId = first;
           status = thread.status ?? args.status;
         }
+        ctx.logger.info(
+          "{action} comment {commentId} in thread {threadId} on pull request {id}",
+          {
+            action: found ? "Found existing" : "Posted",
+            commentId,
+            threadId,
+            id: args.pullRequestId,
+          },
+        );
         return {
           dataHandles: [
             await ctx.writeResource(
@@ -703,6 +914,7 @@ export const model = {
               {},
               undefined,
               ctx.signal,
+              RawThreadShape,
             ),
           )
           : null;
@@ -719,6 +931,7 @@ export const model = {
             {},
             { content: args.content, parentCommentId: 1, commentType: 1 },
             ctx.signal,
+            RawCommentShape,
           );
           commentId = posted.id;
         }
@@ -730,9 +943,20 @@ export const model = {
             {},
             { status: args.status },
             ctx.signal,
+            RawCommentShape,
           );
           status = updated.status ?? args.status;
         }
+        ctx.logger.info(
+          "{action} reply {commentId} in thread {threadId} on pull request {id}; thread is {status}",
+          {
+            action: existing ? "Found existing" : "Posted",
+            commentId,
+            threadId: args.threadId,
+            id: args.pullRequestId,
+            status,
+          },
+        );
         return {
           dataHandles: [
             await ctx.writeResource(
@@ -780,6 +1004,14 @@ export const model = {
           args.pullRequestId,
           true,
           ctx.signal,
+        );
+        ctx.logger.info(
+          "Set thread {threadId} on pull request {id} to {status}",
+          {
+            threadId: args.threadId,
+            id: args.pullRequestId,
+            status: args.status,
+          },
         );
         return { dataHandles: [await writeSnapshot(ctx, pr)] };
       },

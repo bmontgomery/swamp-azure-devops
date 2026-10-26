@@ -72,7 +72,15 @@ comments".
 - The token is sent as HTTP Basic auth, never in URLs.
 - A wrong or expired token makes Azure DevOps return a sign-in page instead of
   an error; this is reported as a failure that says to check the token.
-- HTTP 429 and 503 are retried with `Retry-After` / exponential backoff.
+- Reads and updates are retried on HTTP 429, 5xx, and network errors, honoring
+  `Retry-After` (capped at 60 seconds) or backing off exponentially; each
+  retry is logged as a warning. Creates (new pull requests, comments, replies)
+  are retried only on 429, so a retry never posts twice.
+- Responses are checked for the fields the extension relies on; an unexpected
+  shape fails with the field that was wrong.
+- `baseUrl` must use https.
+- If two runs create the same pull request at once, the second reuses the
+  first one's pull request instead of failing.
 - `skipIfContains` on `addComment` and `reply` makes posting safe to retry.
 
 ## Development

@@ -1,11 +1,16 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.13";
 import {
   AdoClient,
+  AdoError,
   branchSlug,
   type FetchFn,
   findComment,
   fromRef,
+  GlobalArgsSchema,
+  MAX_RETRY_DELAY_MS,
   model,
+  retryDelayMs,
+  sleep,
   toPullRequest,
   toRef,
   toThread,
@@ -267,7 +272,7 @@ function fakeCtx() {
         written.push({ spec, name, data });
         return Promise.resolve({ name });
       },
-      logger: { info: () => {} },
+      logger: { info: () => {}, warning: () => {} },
     },
   };
 }
@@ -414,4 +419,151 @@ Deno.test("reply posts to the thread, then marks it fixed", async () => {
     assertEquals(written[0].name, "comment-7-5");
     assertEquals(written[0].data.threadStatus, "fixed");
   });
+});
+
+// ---- retries, response checks, and races ----
+
+const fast = { "Retry-After": "0.01" };
+
+function sequence(...responses: Array<() => Response>): {
+  stub: FetchFn;
+  count: () => number;
+} {
+  let n = 0;
+  return {
+    stub: () =>
+      Promise.resolve(responses[Math.min(n++, responses.length - 1)]()),
+    count: () => n,
+  };
+}
+
+Deno.test("reads retry on 5xx and network errors, and report each retry", async () => {
+  let n = 0;
+  const stub: FetchFn = () => {
+    n++;
+    if (n === 1) return Promise.reject(new TypeError("connection reset"));
+    if (n === 2) {
+      return Promise.resolve(new Response("", { status: 502, headers: fast }));
+    }
+    return Promise.resolve(json({ ok: true }));
+  };
+  const retries: string[] = [];
+  const client = new AdoClient(
+    globalArgs,
+    stub,
+    3,
+    (r) => retries.push(r.reason),
+  );
+  assertEquals(
+    (await client.request<{ ok: boolean }>("GET", "/x")).ok,
+    true,
+  );
+  assertEquals(retries, ["network error: connection reset", "HTTP 502"]);
+});
+
+Deno.test("creates are retried only on 429, never after a 503 or a network error", async () => {
+  const unavailable = sequence(
+    () => new Response("busy", { status: 503, headers: fast }),
+    () => json({ id: 1 }),
+  );
+  const error = await assertRejects(
+    () =>
+      new AdoClient(globalArgs, unavailable.stub).request("POST", "/x", {}, {}),
+    AdoError,
+  );
+  assertEquals(error.status, 503);
+  assertEquals(unavailable.count(), 1);
+
+  let calls = 0;
+  const offline: FetchFn = () => {
+    calls++;
+    return Promise.reject(new TypeError("offline"));
+  };
+  await assertRejects(
+    () => new AdoClient(globalArgs, offline).request("POST", "/x", {}, {}),
+    AdoError,
+    "network error: offline",
+  );
+  assertEquals(calls, 1);
+
+  const limited = sequence(
+    () => new Response("", { status: 429, headers: fast }),
+    () => json({ id: 1 }),
+  );
+  await new AdoClient(globalArgs, limited.stub).request("POST", "/x", {}, {});
+  assertEquals(limited.count(), 2);
+});
+
+Deno.test("retry delays honor Retry-After but are capped", () => {
+  assertEquals(retryDelayMs(0, "2"), 2000);
+  assertEquals(retryDelayMs(2, null), 4000);
+  assertEquals(retryDelayMs(0, "86400"), MAX_RETRY_DELAY_MS);
+  assertEquals(retryDelayMs(10, null), MAX_RETRY_DELAY_MS);
+});
+
+Deno.test("a retry wait stops as soon as the run is cancelled", async () => {
+  const controller = new AbortController();
+  const waiting = sleep(MAX_RETRY_DELAY_MS, controller.signal);
+  controller.abort(new Error("cancelled"));
+  await assertRejects(() => waiting, Error, "cancelled");
+});
+
+Deno.test("an unexpected response shape fails with the field that is wrong", async () => {
+  await withFakeAdo({
+    "GET /pullrequests/42": () => ({ pullRequestId: "42" }),
+    "GET /pullrequests/42/threads": () => ({ value: [] }),
+  }, async () => {
+    const { ctx } = fakeCtx();
+    await assertRejects(
+      () =>
+        model.methods.get.execute(
+          { pullRequestId: 42, includeThreads: true },
+          ctx,
+        ),
+      AdoError,
+      "unexpected response: pullRequestId",
+    );
+  });
+});
+
+Deno.test("ensurePullRequest reuses the PR another run created first (409)", async () => {
+  let searches = 0;
+  await withFakeAdo({
+    "GET /pullrequests": () => ({ value: searches++ === 0 ? [] : [rawPr] }),
+    "GET /pullrequests/42": () => rawPr,
+    "GET /pullrequests/42/threads": () => ({ value: [] }),
+  }, async () => {
+    const original = globalThis.fetch;
+    const faked = globalThis.fetch;
+    globalThis.fetch = ((input: string, init?: RequestInit) =>
+      init?.method === "POST"
+        ? Promise.resolve(json({ message: "TF401179: active PR exists" }, 409))
+        : faked(input, init)) as typeof fetch;
+    try {
+      const { ctx, written } = fakeCtx();
+      await model.methods.ensurePullRequest.execute({
+        sourceBranch: "feature/x",
+        targetBranch: "master",
+        title: "T",
+        description: "",
+        draft: true,
+      }, ctx);
+      assertEquals(written[1].data.pullRequestId, 42);
+      assertEquals(written[1].data.created, false);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+Deno.test("baseUrl must be https so the token is never sent in clear text", () => {
+  assertEquals(
+    GlobalArgsSchema.safeParse({
+      ...globalArgs,
+      baseUrl: "http://ado.example.com",
+    })
+      .success,
+    false,
+  );
+  assertEquals(GlobalArgsSchema.safeParse(globalArgs).success, true);
 });
