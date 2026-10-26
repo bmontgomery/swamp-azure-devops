@@ -62,7 +62,10 @@ The `pr-<id>` snapshot includes each reviewer's `vote` and a readable
 `waitingForAuthor`, `rejected`), the PR `status` (`active`, `completed`,
 `abandoned`), `isDraft`, and every non-deleted thread with its file, line,
 status, and comments. Comments have `commentType` `text` (people) or `system`
-(Azure DevOps events such as votes and pushes).
+(Azure DevOps events such as votes and pushes). `get` with
+`includeThreads: false` writes an empty `threads` list with
+`threadsIncluded: false`, so check that flag before treating it as "no
+comments".
 
 ## Behavior notes
 

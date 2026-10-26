@@ -30,8 +30,8 @@ Deno.test("branch helpers normalize refs and slugs", () => {
   assertEquals(toRef("refs/heads/feature/x"), "refs/heads/feature/x");
   assertEquals(fromRef("refs/heads/hotfix/y"), "hotfix/y");
   assertEquals(
-    branchSlug("refs/heads/feature/XHK4o0OX-sale result"),
-    "feature-XHK4o0OX-sale-result",
+    branchSlug("refs/heads/feature/AbCd1234-my change"),
+    "feature-AbCd1234-my-change",
   );
 });
 
@@ -99,7 +99,7 @@ const rawThread = {
     {
       id: 1,
       parentCommentId: 0,
-      author: { displayName: "Pat", uniqueName: "pat@roup" },
+      author: { displayName: "Pat", uniqueName: "pat@example.com" },
       content: "Use the enum",
       publishedDate: "t1",
       commentType: "text",
@@ -119,7 +119,7 @@ Deno.test("toThread keeps location and drops deleted comments", () => {
   assertEquals(t.filePath, "/design/x.md");
   assertEquals(t.line, 12);
   assertEquals(t.comments.map((c) => c.id), [1]);
-  assertEquals(t.comments[0].authorUniqueName, "pat@roup");
+  assertEquals(t.comments[0].authorUniqueName, "pat@example.com");
 });
 
 Deno.test("toPullRequest labels votes and strips refs", () => {
@@ -148,7 +148,54 @@ Deno.test("toPullRequest labels votes and strips refs", () => {
     "approved",
   ]);
   assertEquals(pr.threads.map((t) => t.id), [7]);
+  assertEquals(pr.threadsIncluded, true);
   assertEquals(pr.closedDate, null);
+  const bare = toPullRequest(
+    { ...rawPr, reviewers: [] },
+    null,
+    "u",
+    "now",
+  );
+  assertEquals(bare.threads, []);
+  assertEquals(bare.threadsIncluded, false);
+});
+
+Deno.test("addComment fails rather than invent a comment id", async () => {
+  await withFakeAdo({
+    "POST /pullrequests/42/threads": () => ({ ...rawThread, comments: [] }),
+  }, async () => {
+    const { ctx, written } = fakeCtx();
+    await assertRejects(
+      () =>
+        model.methods.addComment.execute({
+          pullRequestId: 42,
+          content: "Hello",
+          status: "active",
+        }, ctx),
+      Error,
+      "no comment id",
+    );
+    assertEquals(written.length, 0);
+  });
+});
+
+Deno.test("reply without a status records the thread's real status", async () => {
+  await withFakeAdo({
+    "GET /pullrequests/42/threads/7": () => rawThread,
+    "POST /pullrequests/42/threads/7/comments": () => ({
+      id: 5,
+      publishedDate: "t",
+    }),
+  }, async (calls) => {
+    const { ctx, written } = fakeCtx();
+    await model.methods.reply.execute({
+      pullRequestId: 42,
+      threadId: 7,
+      content: "Noted",
+    }, ctx);
+    assertEquals(calls.some((c) => c.method === "PATCH"), false);
+    assertEquals(written[0].data.threadStatus, "active");
+  });
 });
 
 Deno.test("findComment locates a marker across threads", () => {
@@ -159,12 +206,12 @@ Deno.test("findComment locates a marker across threads", () => {
       id: 9,
       comments: [{
         id: 1,
-        content: "x `ai-pipeline:td-v1`",
+        content: "x `bot-marker:v1`",
         publishedDate: "t",
       }],
     }),
   ];
-  assertEquals(findComment(threads, "ai-pipeline:td-v1")?.thread.id, 9);
+  assertEquals(findComment(threads, "bot-marker:v1")?.thread.id, 9);
   assertEquals(findComment(threads, "nope"), null);
 });
 
@@ -290,6 +337,7 @@ Deno.test("update publishes a draft and rejects an empty update", async () => {
   await withFakeAdo({
     "PATCH /pullrequests/42": () => ({ ...rawPr, isDraft: false }),
     "GET /pullrequests/42": () => ({ ...rawPr, isDraft: false }),
+    "GET /pullrequests/42/threads": () => ({ value: [rawThread] }),
   }, async (calls) => {
     const { ctx, written } = fakeCtx();
     await model.methods.update.execute(
@@ -298,6 +346,9 @@ Deno.test("update publishes a draft and rejects an empty update", async () => {
     );
     assertEquals(calls[0].body, { isDraft: false });
     assertEquals(written[0].data.isDraft, false);
+    // The snapshot replaces the latest pr-42, so it keeps the threads.
+    assertEquals(written[0].data.threadsIncluded, true);
+    assertEquals((written[0].data.threads as unknown[]).length, 1);
     await assertRejects(
       () => model.methods.update.execute({ pullRequestId: 42 }, ctx),
       Error,
@@ -315,7 +366,7 @@ Deno.test("addComment with skipIfContains finds the earlier comment instead of p
         id: 3,
         comments: [{
           id: 1,
-          content: "Design ready `ai-pipeline:td-v1`",
+          content: "Design ready `bot-marker:v1`",
           publishedDate: "t",
         }],
       }],
@@ -324,9 +375,9 @@ Deno.test("addComment with skipIfContains finds the earlier comment instead of p
     const { ctx, written } = fakeCtx();
     await model.methods.addComment.execute({
       pullRequestId: 42,
-      content: "Design ready `ai-pipeline:td-v1`",
+      content: "Design ready `bot-marker:v1`",
       status: "closed",
-      skipIfContains: "ai-pipeline:td-v1",
+      skipIfContains: "bot-marker:v1",
     }, ctx);
     assertEquals(calls.some((c) => c.method === "POST"), false);
     assertEquals(written[0].name, "comment-3-1");

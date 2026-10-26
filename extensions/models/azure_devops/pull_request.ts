@@ -79,7 +79,7 @@ export const PullRequestSchema = z.object({
   url: z.string().describe("Web URL of the pull request."),
   title: z.string(),
   description: z.string(),
-  status: z.enum(["active", "completed", "abandoned", "notSet", "all"]),
+  status: z.enum(["active", "completed", "abandoned", "notSet"]),
   isDraft: z.boolean(),
   sourceBranch: z.string(),
   targetBranch: z.string(),
@@ -91,6 +91,9 @@ export const PullRequestSchema = z.object({
   lastMergeCommit: z.string().nullable(),
   reviewers: z.array(ReviewerSchema),
   threads: z.array(ThreadSchema),
+  threadsIncluded: z.boolean().describe(
+    'False when threads were not fetched; `threads` is then empty, not "no comments".',
+  ),
   fetchedAt: z.string(),
 });
 
@@ -304,7 +307,7 @@ export function toThread(t: RawThread): Thread {
 /** Map a raw pull request (plus threads) to the stored snapshot. */
 export function toPullRequest(
   pr: RawPullRequest,
-  threads: RawThread[],
+  threads: RawThread[] | null,
   url: string,
   fetchedAt: string,
 ): PullRequest {
@@ -331,7 +334,8 @@ export function toPullRequest(
       voteLabel: VOTE_LABELS[r.vote] ?? String(r.vote),
       isRequired: r.isRequired ?? false,
     })),
-    threads: threads.filter((t) => !t.isDeleted).map(toThread),
+    threads: (threads ?? []).filter((t) => !t.isDeleted).map(toThread),
+    threadsIncluded: threads !== null,
     fetchedAt,
   };
 }
@@ -359,7 +363,7 @@ export async function fetchPullRequest(
         undefined,
         signal,
       ).then((r) => r.value)
-      : Promise.resolve([]),
+      : Promise.resolve(null),
   ]);
   return toPullRequest(
     pr,
@@ -410,7 +414,7 @@ export function findComment(
 /** Model definition for `@bmonty/azure-devops/pull-request`. */
 export const model = {
   type: "@bmonty/azure-devops/pull-request",
-  version: "2026.10.24.1",
+  version: "2026.10.26.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     pullRequest: {
@@ -567,10 +571,11 @@ export const model = {
           patch,
           ctx.signal,
         );
+        // Threads too: this snapshot replaces the latest `pr-<id>`.
         const pr = await fetchPullRequest(
           client,
           args.pullRequestId,
-          false,
+          true,
           ctx.signal,
         );
         return { dataHandles: [await writeSnapshot(ctx, pr)] };
@@ -631,8 +636,14 @@ export const model = {
             },
             ctx.signal,
           );
+          const first = thread.comments?.[0]?.id;
+          if (first === undefined) {
+            throw new Error(
+              `Created thread ${thread.id} on pull request ${args.pullRequestId}, but the response has no comment id`,
+            );
+          }
           threadId = thread.id;
-          commentId = thread.comments?.[0]?.id ?? 1;
+          commentId = first;
           status = thread.status ?? args.status;
         }
         return {
@@ -682,9 +693,10 @@ export const model = {
         const base =
           `/pullrequests/${args.pullRequestId}/threads/${args.threadId}`;
         let commentId: number | undefined;
-        if (args.skipIfContains) {
-          const marker = args.skipIfContains;
-          const thread = toThread(
+        // The thread is needed for the marker check and, when the status is
+        // left alone, to record the thread's real status.
+        const thread = args.skipIfContains || !args.status
+          ? toThread(
             await client.request<RawThread>(
               "GET",
               base,
@@ -692,7 +704,10 @@ export const model = {
               undefined,
               ctx.signal,
             ),
-          );
+          )
+          : null;
+        if (args.skipIfContains && thread) {
+          const marker = args.skipIfContains;
           commentId = thread.comments.find((c) => c.content.includes(marker))
             ?.id;
         }
@@ -707,7 +722,7 @@ export const model = {
           );
           commentId = posted.id;
         }
-        let status = "unchanged";
+        let status = thread?.status ?? "unknown";
         if (args.status) {
           const updated = await client.request<RawThread>(
             "PATCH",
