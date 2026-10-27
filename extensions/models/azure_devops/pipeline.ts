@@ -23,6 +23,9 @@ import {
 
 export { AdoError, type FetchFn } from "./_lib/client.ts";
 
+/** Most pipelines `list` reads in one call. */
+export const MAX_PIPELINES = 1000;
+
 /** Global arguments shared by every method. The token needs Build (Read & Execute). */
 export const GlobalArgsSchema = ConnectionArgsSchema;
 
@@ -41,6 +44,9 @@ export const PipelineSchema = z.object({
 /** The project's pipelines (`pipelines`). */
 export const PipelineListSchema = z.object({
   pipelines: z.array(PipelineSchema),
+  truncated: z.boolean().describe(
+    `True when the project has more than ${MAX_PIPELINES} pipelines and only the first ${MAX_PIPELINES} were read.`,
+  ),
   listedAt: z.string(),
 });
 
@@ -440,8 +446,15 @@ interface RunArgs {
 /** Model definition for `@bmonty/azure-devops/pipeline`. */
 export const model = {
   type: "@bmonty/azure-devops/pipeline",
-  version: "2026.10.26.2",
+  version: "2026.10.27.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.10.27.1",
+      description: "Version bump for the first publish; no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     pipelines: {
       description: "The project's pipelines (`pipelines`)",
@@ -489,11 +502,18 @@ export const model = {
         const raw = await client.request<{ value: RawPipeline[] }>(
           "GET",
           "/pipelines",
-          { "$top": "1000" },
+          { "$top": String(MAX_PIPELINES) },
           undefined,
           ctx.signal,
           RawPipelineListShape,
         );
+        const truncated = raw.value.length >= MAX_PIPELINES;
+        if (truncated) {
+          ctx.logger.warning(
+            "Only the first {max} pipelines were read; narrow with folder",
+            { max: MAX_PIPELINES },
+          );
+        }
         const pipelines = raw.value
           .filter((p) => !args.folder || p.folder === args.folder)
           .map((p) => ({
@@ -510,6 +530,7 @@ export const model = {
           dataHandles: [
             await ctx.writeResource("pipelines", "pipelines", {
               pipelines,
+              truncated,
               listedAt: new Date().toISOString(),
             }),
           ],
@@ -577,25 +598,37 @@ export const model = {
           ctx.signal,
           RawRunShape,
         );
-        ctx.logger.info("Queued run {runId}: {url}", {
-          runId: queued.id,
-          url: queued._links?.web?.href ?? client.runUrl(queued.id),
-        });
-        const run = await waitForRun(
-          client,
-          args.pipelineId,
-          queued.id,
-          args.waitMinutes,
-          args.pollSeconds,
-          ctx,
+        const url = queued._links?.web?.href ?? client.runUrl(queued.id);
+        ctx.logger.info("Queued run {runId}: {url}", { runId: queued.id, url });
+        // Record the run before following it, so a failure while waiting
+        // still leaves its id behind and a retry can read it instead of
+        // queuing a second run.
+        const write = (run: Run) =>
+          Promise.all([
+            ctx.writeResource("run", `run-${run.id}`, run),
+            ctx.writeResource("run", `latest-${args.pipelineId}`, run),
+          ]);
+        await write(
+          toRun(queued, args.pipelineId, null, url, new Date().toISOString()),
         );
+        let run: Run;
+        try {
+          run = await waitForRun(
+            client,
+            args.pipelineId,
+            queued.id,
+            args.waitMinutes,
+            args.pollSeconds,
+            ctx,
+          );
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `Run ${queued.id} was queued (${url}) but following it failed: ${reason}. Read it with getRun instead of queuing it again.`,
+          );
+        }
         logRun(ctx, run);
-        return {
-          dataHandles: [
-            await ctx.writeResource("run", `run-${run.id}`, run),
-            await ctx.writeResource("run", `latest-${args.pipelineId}`, run),
-          ],
-        };
+        return { dataHandles: await write(run) };
       },
     },
     listRuns: {

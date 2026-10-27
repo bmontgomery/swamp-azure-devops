@@ -1,7 +1,8 @@
-import { assertEquals } from "jsr:@std/assert@1.0.13";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.13";
 import {
   type FetchFn,
   isSettled,
+  MAX_PIPELINES,
   model,
   PipelineClient,
   type RawTimelineRecord,
@@ -229,8 +230,25 @@ Deno.test("list filters by folder and writes one pipelines record", async () => 
   );
   assertEquals(f.writes.length, 1);
   assertEquals(f.writes[0].name, "pipelines");
-  const data = f.writes[0].data as { pipelines: Array<{ id: number }> };
+  const data = f.writes[0].data as {
+    pipelines: Array<{ id: number }>;
+    truncated: boolean;
+  };
   assertEquals(data.pipelines.map((p) => p.id), [2]);
+  assertEquals(data.truncated, false);
+});
+
+Deno.test("list says when it hit the pipeline limit", async () => {
+  const f = fakeContext({
+    "GET /pipelines": {
+      value: Array.from(
+        { length: MAX_PIPELINES },
+        (_, i) => ({ id: i + 1, name: `p${i}` }),
+      ),
+    },
+  });
+  await withFetch(f.stub, () => model.methods.list.execute({}, f.ctx));
+  assertEquals((f.writes[0].data as { truncated: boolean }).truncated, true);
 });
 
 Deno.test("run queues once, reads the run, and writes run-<id> and latest-<pipeline>", async () => {
@@ -265,8 +283,43 @@ Deno.test("run queues once, reads the run, and writes run-<id> and latest-<pipel
     resources: { repositories: { self: { refName: "refs/heads/master" } } },
     templateParameters: { environment: "test" },
   });
-  assertEquals(f.writes.map((w) => w.name), ["run-77", "latest-5"]);
-  assertEquals((f.writes[0].data as { result: string }).result, "succeeded");
+  // Recorded as soon as it is queued, then again once settled.
+  assertEquals(f.writes.map((w) => w.name), [
+    "run-77",
+    "latest-5",
+    "run-77",
+    "latest-5",
+  ]);
+  assertEquals((f.writes[0].data as { state: string }).state, "inProgress");
+  assertEquals((f.writes[2].data as { result: string }).result, "succeeded");
+});
+
+Deno.test("run keeps the queued run's id when following it fails", async () => {
+  const f = fakeContext({
+    "POST /pipelines/5/runs": {
+      id: 79,
+      state: "inProgress",
+      createdDate: "2026-10-26T10:00:00Z",
+    },
+    // No GET responses: reading the run fails with 404.
+  });
+  const error = await assertRejects(() =>
+    withFetch(f.stub, () =>
+      model.methods.run.execute({
+        pipelineId: 5,
+        templateParameters: {},
+        variables: {},
+        stagesToSkip: [],
+        waitMinutes: 0,
+        pollSeconds: 5,
+      }, f.ctx))
+  );
+  assertEquals(f.calls.filter((c) => c.method === "POST").length, 1);
+  assertEquals(f.writes.map((w) => w.name), ["run-79", "latest-5"]);
+  assertEquals(
+    (error as Error).message.includes("Run 79 was queued"),
+    true,
+  );
 });
 
 Deno.test("getRun treats a missing timeline as not started, not an error", async () => {

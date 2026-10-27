@@ -111,8 +111,12 @@ data.latest("my-deploys", "latest-12").attributes.result
 data.latest("my-deploys", "latest-12").attributes.waitingForApproval
 ```
 
-Each call to `run` queues a new run; a caller that retries a failed step may
-queue a second one.
+Each call to `run` queues a new run. The run is recorded (`run-<runId>`,
+`latest-<pipelineId>`) as soon as it is queued, so if following it fails, the
+error names the run and `latest-<pipelineId>` still points at it: read it with
+`getRun` rather than retrying `run`, which would queue a second one.
+
+`list` reads up to 1000 pipelines; `truncated` is true when there may be more.
 
 ## Behavior notes
 

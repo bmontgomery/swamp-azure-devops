@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@bmonty/azure-devops"
-version: "2026.10.26.2"
+version: "2026.10.27.1"
 license: MIT
 description: "Drive Azure DevOps from swamp workflows: run pull request reviews (draft PRs, reviewer votes, comment threads) and run YAML pipelines (queue with parameters, follow stages, stop at approvals)."
 repository: https://github.com/bmontgomery/swamp-azure-devops

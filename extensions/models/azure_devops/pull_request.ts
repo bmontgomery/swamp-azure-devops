@@ -419,8 +419,16 @@ export function findComment(
 /** Model definition for `@bmonty/azure-devops/pull-request`. */
 export const model = {
   type: "@bmonty/azure-devops/pull-request",
-  version: "2026.10.26.2",
+  version: "2026.10.27.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.10.27.1",
+      description:
+        "Connection settings moved to a shared module; no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     pullRequest: {
       description:
